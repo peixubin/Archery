@@ -153,6 +153,55 @@ class PgSQLEngine(EngineBase):
         )
         return result
 
+    def parse_plan_line(self,line) :
+        pattern=re.compile(r'\((.+)\s')
+        match=pattern.search(line)
+        cost_string=match.group(1)
+        print("cost_string:",cost_string)
+        params = re.findall(r"(\w+)=([\d\.]+)", cost_string)
+        result={'cost':0,'rows':0}
+        for param in params:
+            print(param[0],param[1])
+            if param[0] == 'cost':
+                print(param[1].split('..'))
+                result['cost'] = float(param[1].split('..')[1])
+            elif param[0] == 'rows':
+                result['rows'] = param[1]
+        return result    
+            
+    def explain_check(self, db_name=None, sql="", close_conn=False):
+        # 使用explain进行支持的SQL语法审核，连接需不中断，防止数据库不断fork进程的大批量消耗
+        result = {"msg": "", "rows": 0, "cost": 0}
+        try:
+            conn = self.get_connection(db_name=db_name)
+            cursor = conn.cursor()
+            if re.match(r"^explain", sql, re.I):
+                sql = sql
+            else:
+                sql = f"explain {sql}"
+            sql = sql.rstrip(";")
+            cursor.execute(sql)
+            # 获取cost            
+            rows = cursor.fetchone()
+            conn.rollback()            
+            if not rows:
+                result["rows"] = 0
+            else:
+                plan_result=self.parse_plan_line(rows[0])
+                result["rows"] = plan_result['rows']
+                result["cost"] = plan_result['cost']
+                #plan_result['cost']
+        except Exception as e:
+            logger.warning(
+                f"pgsql 语句执行报错，语句：{sql}，错误信息{traceback.format_exc()}"
+            )
+            result["msg"] = str(e)
+        finally:
+            if close_conn:
+                self.close()
+            return result
+
+
     def query_check(self, db_name=None, sql=""):
         # 查询语句的检查、注释去除、切分
         result = {"msg": "", "bad_query": False, "filtered_sql": sql, "has_star": False}
@@ -167,9 +216,9 @@ class PgSQLEngine(EngineBase):
         if re.match(r"^select|^explain", sql, re.I) is None:
             result["bad_query"] = True
             result["msg"] = "不支持的查询语法类型!"
-        if "*" in sql:
+        if "*" in sql :
             result["has_star"] = True
-            result["msg"] += "SQL语句中含有 * "
+            result["msg"] = "SQL语句中含有 * "
         return result
 
     def query(
@@ -237,6 +286,7 @@ class PgSQLEngine(EngineBase):
 
     def execute_check(self, db_name=None, sql=""):
         """上线单执行前的检查, 返回Review set"""
+        print("execute check : ",sql)
         config = SysConfig()
         check_result = ReviewSet(full_sql=sql)
         # 禁用/高危语句检查
@@ -267,15 +317,35 @@ class PgSQLEngine(EngineBase):
 
             # 正常语句
             else:
-                result = ReviewResult(
-                    id=line,
-                    errlevel=0,
-                    stagestatus="Audit completed",
-                    errormessage="None",
-                    sql=statement,
-                    affected_rows=0,
-                    execute_time=0,
-                )
+                
+                explain_result=self.explain_check(db_name=db_name,sql=statement,close_conn=False)
+                if explain_result['msg'] : 
+                    result = ReviewResult(
+                                id=line,
+                                errlevel=2,
+                                stagestatus="explain语法检查未通过！",
+                                errormessage=explain_result["msg"],
+                                sql=statement,
+                            )
+                else :
+                    affected_rows=explain_result['cost']
+                    actual_affected_rows = explain_result['rows']
+                    result = ReviewResult(
+                        id=line,
+                        errlevel=0,
+                        stagestatus="Audit completed",
+                        errormessage="None",
+                        sql=statement,
+                        affected_rows=affected_rows,
+                        actual_affected_rows = actual_affected_rows,
+                        execute_time=0,
+                    )
+                    if affected_rows > 1000*2 or actual_affected_rows > 1000 :
+                        result.errlevel = 1
+                        result.errormessage="执行成本大于审核值"
+                        result.stagestatus="Warning"  
+                    
+                           
             # 判断工单类型
             if get_syntax_type(statement) == "DDL":
                 check_result.syntax_type = 1
